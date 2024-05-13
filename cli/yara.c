@@ -170,6 +170,8 @@ static long max_strings_per_rule = DEFAULT_MAX_STRINGS_PER_RULE;
 static long max_process_memory_chunk = DEFAULT_MAX_PROCESS_MEMORY_CHUNK;
 static long long skip_larger = 0;
 
+static long id = 0;
+
 #define USAGE_STRING \
   "Usage: yara [OPTION]... [NAMESPACE:]RULES_FILE... FILE | DIR | PID"
 
@@ -488,6 +490,19 @@ static bool is_directory(const char_t* path)
     return false;
 }
 
+void GetMyPath(wchar_t* wtr)
+{
+  GetModuleFileName(GetModuleHandle(NULL), wtr, 240);
+  for (int i = (int) wcslen(wtr) - 1; i >= 0; i--)
+  {
+    if (wtr[i] == '\\')
+    {
+      wtr[i] = '\x0';
+      break;
+    }
+  }
+}
+
 static int scan_dir(const char_t* dir, SCAN_OPTIONS* scan_opts)
 {
   int result = ERROR_SUCCESS;
@@ -498,10 +513,65 @@ static int scan_dir(const char_t* dir, SCAN_OPTIONS* scan_opts)
   WIN32_FIND_DATA FindFileData;
   HANDLE hFind = FindFirstFile(path, &FindFileData);
 
+  TCHAR m_FilePath[240];
+  GetMyPath(m_FilePath);
+  _tcscat_s(m_FilePath, 240, _T("\\yara.log"));
+
   if (hFind != INVALID_HANDLE_VALUE)
   {
     do
     {
+      // _ftprintf( stderr, _T("%d\n"), id);
+      FILE* logFile = _tfopen(m_FilePath, _T("a"));
+      id++;
+      
+      HANDLE hMutex = OpenMutex(
+          SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, _T("SharedIntegerMutex"));
+      if (hMutex == NULL)
+      {
+        FILE* logFile = _tfopen(m_FilePath, _T("a"));
+        _ftprintf(logFile, _T("OpenMutex Failed\n"));
+        fclose(logFile);
+        return 0;
+      }
+
+      // Create a shared memory object
+      HANDLE hMapFile = OpenFileMapping(
+          FILE_MAP_ALL_ACCESS, FALSE, _T("SharedInteger"));
+
+      if (hMapFile == NULL)
+      {
+        FILE* logFile = _tfopen(m_FilePath, _T("a"));
+        _ftprintf(logFile, _T("CreateFileMapping Failed\n"));
+        fclose(logFile);
+        return 0;
+      }
+
+      // Map the shared memory into the process address space
+      int* pInt = (int*) MapViewOfFile(
+          hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(int));
+
+      if (pInt == NULL)
+      {
+        FILE* logFile = _tfopen(m_FilePath, _T("a"));
+        _ftprintf(logFile, _T("MapViewOfFile Failed\n"));
+        fclose(logFile);
+        return 0;
+      }
+
+      if (id % 5000 == 0)
+      {
+        WaitForSingleObject(hMutex, INFINITE);
+        *pInt = id;
+        ReleaseMutex(hMutex);
+      }
+
+      UnmapViewOfFile(pInt);
+      CloseHandle(hMapFile);
+
+      fclose(logFile);
+
+
       _sntprintf(path, MAX_PATH, _T("%s\\%s"), dir, FindFileData.cFileName);
 
       if (!(FindFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
@@ -556,8 +626,9 @@ static int scan_file(YR_SCANNER* scanner, const char_t* filename)
 
   if (fd == INVALID_HANDLE_VALUE)
     return ERROR_COULD_NOT_OPEN_FILE;
-
+  
   int result = yr_scanner_scan_fd(scanner, fd);
+  _ftprintf(stderr, _T("result %d\n"), result);
 
   CloseHandle(fd);
 
@@ -1056,6 +1127,13 @@ static int handle_message(
 
     _tprintf(_T("%" PF_S " "), rule->identifier);
 
+    // write match file name to log file
+    TCHAR m_FilePath[240];
+    GetMyPath(m_FilePath);
+    _tcscat_s(m_FilePath, 240, _T("\\match"));
+    FILE* logFile = _tfopen(m_FilePath, _T("a"));
+    _ftprintf(logFile, _T("%" PF_S "|"), rule->identifier);
+
     if (show_tags)
     {
       _tprintf(_T("["));
@@ -1108,6 +1186,10 @@ static int handle_message(
     }
 
     _tprintf(_T("%s\n"), ((CALLBACK_ARGS*) data)->file_path);
+
+    // write match rule to log file
+    _ftprintf(logFile, _T("%s \n"), ((CALLBACK_ARGS*) data)->file_path);
+    fclose(logFile);
 
     // Show matched strings.
 
